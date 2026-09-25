@@ -20,6 +20,14 @@
 - 首末有效时间跨度 >= min_duration_seconds（边界合格）；
 - 段内读数条数 >= min_readings。
 
+阈值一律按原始秒值比较：时间先取整为整数微秒，再以
+``微秒差 / 1_000_000`` 与阈值比较（间隔严格大于阈值才断裂、
+跨度大于等于阈值即合格），不做四舍五入，故 2μs 间隔在
+max_gap_seconds=0.0000015 下必断裂、2μs 跨度在
+min_duration_seconds=0.0000025 下必不合格。波动比较边界含等号，
+仅容忍浮点表示误差（相对容差），不设绝对容差：max_fluctuation=0
+时任何非零波动都不合格。
+
 求解（一次线性扫描，每个断裂块独立）：
 - 以每条读数 j 为右端点，单调双端队列分别维护段内最小 / 最大读数窗口，
   得到满足波动约束的最小可行起点 L(j)（与断裂块起点取最大）；
@@ -31,8 +39,8 @@
 """
 
 import json
+import math
 import sqlite3
-from bisect import bisect_right
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -41,6 +49,10 @@ from typing import Deque, List, Optional
 from .schemas import WarmupReading, WarmupReleaseResponse, WarmupSegment
 
 _US_PER_SECOND = 1_000_000
+# 波动比较的相对容差：仅吸收 max-min 与阈值各自的浮点表示误差
+# （如 21.6 - 20.0 = 1.6000000000000014）；abs_tol 固定为 0，
+# 阈值为 0 时不得吞掉任何微小但真实的非零波动。
+_FLUCTUATION_REL_TOL = 1e-12
 
 
 class WarmupError(ValueError):
@@ -185,21 +197,23 @@ def find_stable_segment(
     if not points:
         return None
 
-    min_duration_us = round(min_duration_seconds * _US_PER_SECOND)
-    max_gap_us = round(max_gap_seconds * _US_PER_SECOND)
-    times = [p.time_us for p in points]
-
     # 单调队列窗口左沿；只在当前断裂块内移动，遇到间隔断裂时整体重置。
     window_lo = 0
     min_q: Deque[int] = deque()  # 值升序：队首为窗口内最小值下标
     max_q: Deque[int] = deque()  # 值降序：队首为窗口内最大值下标
 
     for j, point in enumerate(points):
-        if j > 0 and point.time_us - points[j - 1].time_us > max_gap_us:
-            # 相邻采样间隔超限：序列在此断开，稳定段不得跨断裂
-            window_lo = j
-            min_q.clear()
-            max_q.clear()
+        if j > 0:
+            gap_seconds = (
+                point.time_us - points[j - 1].time_us
+            ) / _US_PER_SECOND
+            if gap_seconds > max_gap_seconds:
+                # 相邻采样间隔严格超限：序列在此断开，稳定段不得跨断裂。
+                # 直接拿整数微秒间隔换算回秒与原始阈值比较，不四舍五入，
+                # 避免 round(0.0000015 * 1e6) 把 1.5μs 抬成 2μs 放行。
+                window_lo = j
+                min_q.clear()
+                max_q.clear()
 
         while min_q and points[min_q[-1]].value >= point.value:
             min_q.pop()
@@ -208,31 +222,35 @@ def find_stable_segment(
             max_q.pop()
         max_q.append(j)
 
-        # 收缩窗口直至最大 - 最小不超过最大波动（边界合格；
-        # 容忍 max-min 与阈值间的浮点表示误差，如 21.6-20.0 的舍入误差）
-        while (
-            points[max_q[0]].value - points[min_q[0]].value
-            > max_fluctuation + 1e-9
+        # 收缩窗口直至最大 - 最小不超过最大波动（边界合格）。
+        # 仅容忍浮点表示误差（相对容差、abs_tol=0）：阈值为 0 时
+        # 任何微小非零波动都必须继续收缩，不得用固定容差放宽。
+        spread = points[max_q[0]].value - points[min_q[0]].value
+        while spread > max_fluctuation and not math.isclose(
+            spread,
+            max_fluctuation,
+            rel_tol=_FLUCTUATION_REL_TOL,
+            abs_tol=0.0,
         ):
             if min_q[0] == window_lo:
                 min_q.popleft()
             if max_q[0] == window_lo:
                 max_q.popleft()
             window_lo += 1
+            spread = points[max_q[0]].value - points[min_q[0]].value
 
         # [window_lo, j] 是以 j 为右端点满足波动与间隔约束的最长段，
         # 其起点最早、读数最多、跨度最大：任何以 j 为右端点的合格段
         # 存在当且仅当它同时达到最少读数与最短时长。
+        # 跨度同样按整数微秒换算回秒与原始阈值比较（边界含），
+        # 避免 round(0.0000025 * 1e6) 把 2.5μs 压成 2μs 误判。
         if j - window_lo + 1 < min_readings:
             continue  # 该块内读数条数尚不足
 
-        duration_ok_at = bisect_right(
-            times,
-            points[j].time_us - min_duration_us,
-            lo=window_lo,
-            hi=j + 1,
-        ) - 1
-        if duration_ok_at >= window_lo:
+        duration_seconds = (
+            points[j].time_us - points[window_lo].time_us
+        ) / _US_PER_SECOND
+        if duration_seconds >= min_duration_seconds:
             return _build_segment(points, window_lo, j)
 
     return None

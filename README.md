@@ -798,6 +798,13 @@ curl 'localhost:8000/api/v1/devices/ph-meter-01/ratio-acceptance/evaluate?from_s
 3. 首末读数的时间跨度**达到** `min_duration_seconds`；
 4. 段内读数条数**不少于** `min_readings`。
 
+间隔与时长按整数微秒精确比较（时间先取整到微秒，再换算回秒与原始
+阈值比较，不做四舍五入）：例如相邻读数相隔 2μs 时，
+`max_gap_seconds=0.0000015` 必判断裂；2μs 的片段在
+`min_duration_seconds=0.0000025` 下必不合格。波动比较边界含等号，
+仅吸收浮点表示误差、不设固定绝对容差：`max_fluctuation=0` 时任何
+非零波动（无论多小）都不合格。
+
 服务端返回**最早完成**（完成时间 = 段末读数的有效时间）的合格段；
 同一完成时间存在多段时取**起点最早**的一段（即该完成时刻可行的最长段）。
 没有任何合格段时 HTTP 仍为 `200`，`released=false`、`segment=null` 并给出

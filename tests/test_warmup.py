@@ -157,6 +157,132 @@ def test_min_duration_boundary_inclusive(client):
     assert release(client, min_duration_seconds=20.1).json()["released"] is False
 
 
+# ---------------------------------------------------------------------------
+# 微秒级阈值边界：间隔 / 时长按原始阈值比较，不得四舍五入放宽
+# ---------------------------------------------------------------------------
+
+def _us_pkg(seq, us_value_pairs, start="2026-09-23T08:00:00"):
+    """各占一个包、时间戳带微秒偏移的读数。
+
+    us_value_pairs: [(相对基准的微秒偏移, 值), ...]
+    """
+    out = []
+    for i, (us, value) in enumerate(us_value_pairs):
+        ts = f"{start}.{us:06d}Z"
+        out.append(pkg(seq + i, f"us-{seq + i}", [m(value, ts=ts)]))
+    return out
+
+
+def test_microsecond_gap_above_threshold_breaks(client):
+    # 相邻读数相隔 2μs，max_gap_seconds=0.0000015（1.5μs）：
+    # round(1.5e-6*1e6) 的银行家舍入会把阈值抬成 2μs 错误放行；
+    # 正确行为是间隔严格超限 -> 断裂 -> 两条单读数块均不成段。
+    for p in _us_pkg(1, [(0, 20.0), (2, 20.0), (4, 20.0)]):
+        client.post("/api/v1/packages", json=p)
+    body = release(
+        client,
+        max_fluctuation=0.0,
+        min_duration_seconds=0.0000005,
+        min_readings=2,
+        max_gap_seconds=0.0000015,
+    ).json()
+    assert body["candidate_count"] == 3
+    assert body["released"] is False
+    assert body["segment"] is None
+
+
+def test_microsecond_gap_at_threshold_allowed(client):
+    # 间隔恰好 1μs <= 1.5μs：不断裂；三条跨度 2μs >= 0.5μs 可成段。
+    for p in _us_pkg(1, [(0, 20.0), (1, 20.0), (2, 20.0)]):
+        client.post("/api/v1/packages", json=p)
+    body = release(
+        client,
+        max_fluctuation=0.0,
+        min_duration_seconds=0.0000005,
+        min_readings=2,
+        max_gap_seconds=0.0000015,
+    ).json()
+    assert body["released"] is True
+    seg = body["segment"]
+    assert seg["reading_count"] == 2
+    assert seg["max_adjacent_gap_seconds"] == pytest.approx(0.000001)
+    assert seg["duration_seconds"] == pytest.approx(0.000001)
+
+
+def test_microsecond_duration_above_floor_rejected(client):
+    # 片段仅 2μs，min_duration_seconds=0.0000025（2.5μs）：
+    # round(2.5e-6*1e6) 的银行家舍入会把阈值压成 2μs 错误放行；
+    # 正确行为是跨度不足，单块 3 条读数也不成段。
+    for p in _us_pkg(1, [(0, 20.0), (1, 20.0), (2, 20.0)]):
+        client.post("/api/v1/packages", json=p)
+    body = release(
+        client,
+        max_fluctuation=0.0,
+        min_duration_seconds=0.0000025,
+        min_readings=2,
+        max_gap_seconds=0.001,
+    ).json()
+    assert body["released"] is False
+    assert body["segment"] is None
+
+
+def test_microsecond_duration_boundary_inclusive(client):
+    # 跨度 3μs >= 2.5μs：放行；跨度恰好 2μs == min_duration 0.000002：
+    # 边界含等号，亦放行。
+    for p in _us_pkg(1, [(0, 20.0), (1, 20.0), (3, 20.0)]):
+        client.post("/api/v1/packages", json=p)
+    body = release(
+        client,
+        max_fluctuation=0.0,
+        min_duration_seconds=0.0000025,
+        min_readings=3,
+        max_gap_seconds=0.001,
+    ).json()
+    assert body["released"] is True
+    assert body["segment"]["reading_count"] == 3
+    assert body["segment"]["duration_seconds"] == pytest.approx(0.000003)
+    body = release(
+        client,
+        max_fluctuation=0.0,
+        min_duration_seconds=0.0000031,
+        min_readings=3,
+        max_gap_seconds=0.001,
+    ).json()
+    assert body["released"] is False
+    assert body["segment"] is None
+
+
+def test_zero_fluctuation_rejects_any_nonzero_spread(client):
+    # max_fluctuation=0 时，5e-10 的微小非零波动不得被固定容差吞掉
+    # （旧实现的 spread > 0 + 1e-9 会放行一切 <=1e-9 的真实波动）
+    for p in _us_pkg(1, [(0, 20.0), (1, 20.0000000005), (2, 20.0)]):
+        client.post("/api/v1/packages", json=p)
+    body = release(
+        client,
+        max_fluctuation=0.0,
+        min_duration_seconds=0.000001,
+        min_readings=2,
+        max_gap_seconds=0.001,
+    ).json()
+    assert body["released"] is False
+    assert body["segment"] is None
+
+
+def test_zero_fluctuation_accepts_exactly_equal_values(client):
+    # 值完全相同：0 波动合格（等号边界）
+    for p in _us_pkg(1, [(0, 20.0), (1, 20.0), (2, 20.0)]):
+        client.post("/api/v1/packages", json=p)
+    body = release(
+        client,
+        max_fluctuation=0.0,
+        min_duration_seconds=0.000001,
+        min_readings=2,
+        max_gap_seconds=0.001,
+    ).json()
+    assert body["released"] is True
+    assert body["segment"]["fluctuation"] == 0.0
+
+
 def test_min_readings_enforced(client):
     for p in stable_readings([20.0, 20.1, 20.2, 20.3]):
         client.post("/api/v1/packages", json=p)

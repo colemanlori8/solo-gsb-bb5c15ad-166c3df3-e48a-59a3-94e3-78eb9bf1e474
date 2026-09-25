@@ -210,6 +210,69 @@ def test_same_completion_time_prefers_earliest_start(client):
 
 
 # ---------------------------------------------------------------------------
+# 微秒级阈值边界：按原始阈值精确比较，不舍入阈值、不额外放宽
+# ---------------------------------------------------------------------------
+
+def test_max_gap_microseconds_not_rounded_up(client):
+    # 相邻读数相隔 2 微秒：max_gap_seconds=0.0000015（1.5µs）必须断裂，
+    # 阈值不得被舍入成 2µs 而放行；=0.000002（恰等）时边界合格
+    for i in range(3):
+        ts = f"2026-09-23T08:00:00.{i * 2:06d}Z"
+        client.post("/api/v1/packages", json=pkg(i + 1, str(i + 1), [m(20.0, ts=ts)]))
+    params = dict(min_duration_seconds=0.000004, min_readings=3,
+                  max_fluctuation=1.0)
+    body = release(client, max_gap_seconds=0.0000015, **params).json()
+    assert body["released"] is False
+    assert body["segment"] is None
+    assert body["candidate_count"] == 3
+    body = release(client, max_gap_seconds=0.000002, **params).json()
+    assert body["released"] is True
+    seg = body["segment"]
+    assert seg["reading_count"] == 3
+    assert seg["duration_seconds"] == pytest.approx(0.000004)
+    assert seg["max_adjacent_gap_seconds"] == pytest.approx(0.000002)
+
+
+def test_min_duration_microseconds_not_rounded_down(client):
+    # 2 微秒片段：min_duration_seconds=0.0000025（2.5µs）不得放行，
+    # 阈值不得被舍入成 2µs；=0.000002（恰等）时边界合格
+    for i in range(2):
+        ts = f"2026-09-23T08:00:00.{i * 2:06d}Z"
+        client.post("/api/v1/packages", json=pkg(i + 1, str(i + 1), [m(20.0, ts=ts)]))
+    params = dict(min_readings=2, max_fluctuation=1.0, max_gap_seconds=1)
+    body = release(client, min_duration_seconds=0.0000025, **params).json()
+    assert body["released"] is False
+    assert body["segment"] is None
+    body = release(client, min_duration_seconds=0.000002, **params).json()
+    assert body["released"] is True
+    assert body["segment"]["reading_count"] == 2
+    assert body["segment"]["duration_seconds"] == pytest.approx(0.000002)
+
+
+def test_zero_max_fluctuation_rejects_tiny_nonzero_fluctuation(client):
+    # max_fluctuation=0：1e-10 的微小非零波动不得被固定容差吞掉；
+    # 波动恰等于阈值时边界合格
+    for i, v in enumerate([20.0, 20.0000000001, 20.0]):
+        ts = f"2026-09-23T08:00:{i * 10:02d}Z"
+        client.post("/api/v1/packages", json=pkg(i + 1, str(i + 1), [m(v, ts=ts)]))
+    body = release(client, max_fluctuation=0).json()
+    assert body["released"] is False
+    assert body["segment"] is None
+    body = release(client, max_fluctuation=0.0000000001).json()
+    assert body["released"] is True
+    assert body["segment"]["fluctuation"] == pytest.approx(0.0000000001)
+
+
+def test_zero_max_fluctuation_allows_exactly_constant_readings(client):
+    for p in stable_readings([20.0, 20.0, 20.0]):
+        client.post("/api/v1/packages", json=p)
+    body = release(client, max_fluctuation=0).json()
+    assert body["released"] is True
+    assert body["segment"]["fluctuation"] == 0
+    assert body["segment"]["reading_count"] == 3
+
+
+# ---------------------------------------------------------------------------
 # 相邻采样间隔：断裂、边界、不跨断裂
 # ---------------------------------------------------------------------------
 

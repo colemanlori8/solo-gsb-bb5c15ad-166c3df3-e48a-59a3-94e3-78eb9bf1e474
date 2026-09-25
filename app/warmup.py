@@ -20,6 +20,13 @@
 - 首末有效时间跨度 >= min_duration_seconds（边界合格）；
 - 段内读数条数 >= min_readings。
 
+阈值比较一律按请求给出的原始十进制阈值精确进行（Decimal），
+不做任何舍入或额外容差：读数值与阈值直接由原始十进制串构造
+Decimal，微秒间隔 / 时长（整数微秒）与阈值换算后的十进制微秒
+比较——1.5 微秒的间隔上限不会放进 2 微秒的间隔，2.5 微秒的时长
+下限不会放行 2 微秒的片段，max_fluctuation=0 也不放过任何非零
+波动；同时 21.6 - 20.0 <= 1.6 这类十进制边界仍然成立。
+
 求解（一次线性扫描，每个断裂块独立）：
 - 以每条读数 j 为右端点，单调双端队列分别维护段内最小 / 最大读数窗口，
   得到满足波动约束的最小可行起点 L(j)（与断裂块起点取最大）；
@@ -36,6 +43,7 @@ from bisect import bisect_right
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from decimal import Decimal
 from typing import Deque, List, Optional
 
 from .schemas import WarmupReading, WarmupReleaseResponse, WarmupSegment
@@ -56,7 +64,7 @@ class _Point:
     time: datetime
     time_us: int  # 自 UTC epoch 的微秒数，避免浮点秒比较误差
     time_source: str  # "ts" / "sent_at"
-    value: float
+    value: Decimal  # 由原始 JSON 十进制串精确构造，避免二进制浮点表示误差
     unit: Optional[str]
 
 
@@ -74,6 +82,22 @@ def _parse_time(raw: str) -> datetime:
 def _to_us(dt: datetime) -> int:
     delta = dt - datetime.fromtimestamp(0, tz=timezone.utc)
     return (delta.days * 86400 + delta.seconds) * _US_PER_SECOND + delta.microseconds
+
+
+def _threshold_seconds_to_us(seconds: float) -> Decimal:
+    """把秒级阈值按原始十进制值精确换算成微秒，不做任何舍入。
+
+    str() 给出能往返还原该浮点数的最短十进制串，即请求中用户给出的
+    原始阈值（如 0.0000015）；与整数微秒比较时 Decimal 精确参与，
+    1.5 微秒的上限不会被舍入成 2 微秒。
+    """
+    return Decimal(str(seconds)) * _US_PER_SECOND
+
+
+def _raw_value(raw) -> Decimal:
+    """读数值统一为 Decimal：parse_float 已保证浮点 JSON 数字按原始
+    十进制串构造；整数 JSON 数字（int）直接精确转换。"""
+    return raw if isinstance(raw, Decimal) else Decimal(raw)
 
 
 def load_readings(
@@ -97,7 +121,9 @@ def load_readings(
         (device_id,),
     ).fetchall()
     for row in rows:
-        payload = json.loads(row["payload_json"])
+        # parse_float=Decimal：读数值按原始十进制串精确构造，
+        # 波动比较不受二进制浮点表示误差影响
+        payload = json.loads(row["payload_json"], parse_float=Decimal)
         raw_sent_at = payload.get("sent_at")
         sent_at = _parse_time(raw_sent_at) if raw_sent_at else None
         for position, measurement in enumerate(payload.get("measurements", [])):
@@ -125,7 +151,7 @@ def load_readings(
                     time=time,
                     time_us=_to_us(time),
                     time_source=time_source,
-                    value=float(measurement["value"]),
+                    value=_raw_value(measurement["value"]),
                     unit=measurement.get("unit"),
                 )
             )
@@ -155,7 +181,7 @@ def _build_segment(
             position=p.position,
             time=p.time,
             time_source=p.time_source,
-            value=p.value,
+            value=float(p.value),
             unit=p.unit,
         )
         for idx, p in enumerate(window)
@@ -166,9 +192,9 @@ def _build_segment(
         end_time=window[-1].time,
         duration_seconds=duration_us / _US_PER_SECOND,
         reading_count=len(window),
-        min_value=min_value,
-        max_value=max_value,
-        fluctuation=max_value - min_value,
+        min_value=float(min_value),
+        max_value=float(max_value),
+        fluctuation=float(max_value - min_value),
         max_adjacent_gap_seconds=max_gap_us / _US_PER_SECOND,
         readings=readings,
     )
@@ -185,8 +211,11 @@ def find_stable_segment(
     if not points:
         return None
 
-    min_duration_us = round(min_duration_seconds * _US_PER_SECOND)
-    max_gap_us = round(max_gap_seconds * _US_PER_SECOND)
+    # 阈值按原始十进制值精确换算 / 构造，不舍入、不加额外容差：
+    # 整数微秒间隔 / 时长与 Decimal 阈值直接比较（边界合格）
+    min_duration_us = _threshold_seconds_to_us(min_duration_seconds)
+    max_gap_us = _threshold_seconds_to_us(max_gap_seconds)
+    max_fluctuation_d = Decimal(str(max_fluctuation))
     times = [p.time_us for p in points]
 
     # 单调队列窗口左沿；只在当前断裂块内移动，遇到间隔断裂时整体重置。
@@ -209,10 +238,11 @@ def find_stable_segment(
         max_q.append(j)
 
         # 收缩窗口直至最大 - 最小不超过最大波动（边界合格；
-        # 容忍 max-min 与阈值间的浮点表示误差，如 21.6-20.0 的舍入误差）
+        # 读数与阈值均为原始十进制精确值，不做任何额外放宽：
+        # max_fluctuation=0 时任何非零波动都会触发收缩）
         while (
             points[max_q[0]].value - points[min_q[0]].value
-            > max_fluctuation + 1e-9
+            > max_fluctuation_d
         ):
             if min_q[0] == window_lo:
                 min_q.popleft()
